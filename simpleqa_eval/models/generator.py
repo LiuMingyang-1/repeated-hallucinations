@@ -96,12 +96,59 @@ class LocalModelGenerator:
         n: int = 10,
         temperature: float = 0.7,
     ) -> List[Tuple[str, float]]:
-        """多次采样，返回 [(答案文本, confidence), ...]"""
+        """批量采样，优先用 num_return_sequences 一次生成 n 条结果。
+
+        Returns:
+            [(答案文本, confidence), ...]
+        """
+        self.load()
+        if n <= 0:
+            return []
+
+        do_sample = temperature > 0
+
+        torch.manual_seed(42)
+
+        prompt = self._build_prompt(question)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        input_len = inputs["input_ids"].shape[1]
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                temperature=max(temperature, 1e-4) if do_sample else 1.0,
+                do_sample=do_sample,
+                top_p=0.95 if do_sample else 1.0,
+                num_return_sequences=n if do_sample else 1,
+                return_dict_in_generate=True,
+                output_scores=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+
+        # outputs.sequences: (n, seq_len)
+        # outputs.scores: tuple of (n, vocab_size) tensors, one per generated position
         results = []
-        for i in range(n):
-            seed = 42 + i * 1000  # 固定种子保证可复现
-            answer, conf = self.generate_answer(question, temperature, seed)
-            results.append((answer, conf))
+        if not do_sample:
+            generated_ids = outputs.sequences[0, input_len:]
+            answer_text = self.tokenizer.decode(
+                generated_ids, skip_special_tokens=True
+            ).strip()
+            confidence = self._compute_confidence(
+                outputs.scores, generated_ids, seq_idx=0
+            )
+            return [(answer_text, confidence) for _ in range(n)]
+
+        for seq_idx in range(n):
+            generated_ids = outputs.sequences[seq_idx, input_len:]
+            answer_text = self.tokenizer.decode(
+                generated_ids, skip_special_tokens=True
+            ).strip()
+            confidence = self._compute_confidence(
+                outputs.scores, generated_ids, seq_idx
+            )
+            results.append((answer_text, confidence))
+
         return results
 
     def _build_prompt(self, question: str) -> str:
@@ -121,12 +168,22 @@ class LocalModelGenerator:
 
         return f"Question: {question}\nAnswer:"
 
-    def _compute_confidence(self, scores: tuple, generated_ids: torch.Tensor) -> float:
+    def _compute_confidence(
+        self,
+        scores: tuple,
+        generated_ids: torch.Tensor,
+        seq_idx: int = 0,
+    ) -> float:
         """
         从生成 token 的 logits 计算 self-confidence。
 
         confidence = exp( mean( log_softmax(logits)[token_id] ) )
         即生成序列的几何平均概率。
+
+        Args:
+            scores: generate 返回的 scores，每个元素 shape 为 (batch, vocab_size)
+            generated_ids: 当前序列的生成 token ids
+            seq_idx: 当前序列在 batch 中的索引
         """
         if len(scores) == 0:
             return 0.0
@@ -135,7 +192,7 @@ class LocalModelGenerator:
         n_tokens = min(len(scores), len(generated_ids))
 
         for i in range(n_tokens):
-            logits = scores[i][0]  # shape: (vocab_size,)
+            logits = scores[i][seq_idx]  # shape: (vocab_size,)
             log_softmax = torch.log_softmax(logits, dim=-1)
             token_id = generated_ids[i].item()
 
